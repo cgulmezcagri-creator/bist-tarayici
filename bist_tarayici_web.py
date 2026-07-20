@@ -104,6 +104,34 @@ st.markdown("""
         margin-top: 10px;
         margin-bottom: 2px;
     }
+    /* Horizontal factors layout */
+    .factor-container {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin-top: 8px;
+        margin-bottom: 8px;
+    }
+    .factor-item {
+        flex: 1;
+        background-color: #1e2535;
+        border: 1px solid #2a3a55;
+        border-radius: 6px;
+        padding: 8px;
+        text-align: center;
+    }
+    .factor-name {
+        font-size: 0.7rem;
+        color: #64748b;
+        font-weight: bold;
+        text-transform: uppercase;
+    }
+    .factor-score {
+        font-family: 'Consolas', monospace;
+        font-size: 1.05rem;
+        font-weight: bold;
+        margin-top: 2px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -142,11 +170,9 @@ BIST_SECTORS = {
 # --- HTTP SESSION CREATION FOR YFINANCE ---
 def get_yf_session():
     session = requests.Session()
-    # Mask headers to look like a desktop browser
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     })
-    # Setup retries with backoff to handle HTTP 429 or network instability
     retries = Retry(
         total=5,
         backoff_factor=1.5,
@@ -296,6 +322,117 @@ def compute_historical_pb_custom(bs, info, price_try_df: pd.DataFrame) -> dict:
         "pb_samples":  pb_samples,
     }
 
+# --- BOFA MULTI-FACTOR QUANTITATIVE MODEL ---
+def calculate_bofa_metrics(hist: pd.DataFrame, info: dict, pb_info: dict) -> dict:
+    # 1. VALUE PILLAR (Değer)
+    # PEG Ratio: PEG <= 1.0 -> 100 pts, PEG >= 2.0 -> 0 pts. Linear interpolation.
+    peg = info.get("pegRatio")
+    if peg is not None:
+        peg_score = max(0.0, min(100.0, 100.0 - (peg - 1.0) * 100.0))
+    else:
+        peg_score = 50.0  # neutral fallback
+        
+    # FCF Yield: Free Cash Flow / Market Cap. Yield >= 8% -> 100 pts, <= 0% -> 0 pts.
+    fcf = info.get("freeCashflow")
+    mcap = info.get("marketCap")
+    fcf_yield = (fcf / mcap) if (fcf and mcap and mcap > 0) else None
+    if fcf_yield is not None:
+        fcf_score = max(0.0, min(100.0, (fcf_yield / 0.08) * 100.0))
+    else:
+        fcf_score = 50.0
+        
+    # P/B Ratio Deviation relative to 5Y historical average
+    pb_ratio = pb_info.get("pb_ratio")
+    if pb_ratio is not None:
+        pb_deviation_score = max(0.0, min(100.0, 100.0 - (pb_ratio - 0.8) * 142.8)) # 0.8 -> 100, 1.5 -> 0
+    else:
+        pb_deviation_score = 50.0
+        
+    value_score = (peg_score + fcf_score + pb_deviation_score) / 3.0
+
+    # 2. GROWTH PILLAR (Büyüme)
+    # Revenue Growth (YoY): Growth >= 30% -> 100 pts, <= 0% -> 0.
+    rev_growth = info.get("revenueGrowth")
+    if rev_growth is not None:
+        rev_growth_score = max(0.0, min(100.0, (rev_growth / 0.3) * 100.0))
+    else:
+        rev_growth_score = 50.0
+        
+    # Earnings Growth (YoY): Growth >= 20% -> 100 pts, <= -10% -> 0.
+    earn_growth = info.get("earningsGrowth")
+    if earn_growth is not None:
+        earn_growth_score = max(0.0, min(100.0, ((earn_growth + 0.1) / 0.3) * 100.0))
+    else:
+        earn_growth_score = 50.0
+        
+    growth_score = (rev_growth_score + earn_growth_score) / 2.0
+
+    # 3. QUALITY PILLAR (Kalite)
+    # ROE (Return on Equity): ROE >= 25% -> 100 pts, <= 5% -> 0.
+    roe = info.get("returnOnEquity")
+    if roe is not None:
+        roe_score = max(0.0, min(100.0, ((roe - 0.05) / 0.20) * 100.0))
+    else:
+        roe_score = 50.0
+        
+    # Debt to Equity: D/E <= 50% -> 100 pts, D/E >= 200% -> 0.
+    de = info.get("debtToEquity")
+    if de is not None:
+        de_val = de / 100.0 if de > 3.0 else de
+        de_score = max(0.0, min(100.0, 100.0 - (de_val - 0.5) * 66.6)) # 0.5 -> 100, 2.0 -> 0
+    else:
+        de_score = 50.0
+        
+    quality_score = (roe_score + de_score) / 2.0
+
+    # 4. MOMENTUM PILLAR (Trend)
+    # 6-Month Return: Return >= 30% -> 100 pts, <= -10% -> 0.
+    mom_score_6m = 50.0
+    ret_6m = None
+    if not hist.empty and len(hist) >= 120:
+        try:
+            close_prices = hist["Close"].values
+            ret_6m = (close_prices[-1] - close_prices[-120]) / close_prices[-120]
+            mom_score_6m = max(0.0, min(100.0, ((ret_6m + 0.1) / 0.4) * 100.0)) # -10% -> 0, +30% -> 100
+        except Exception:
+            mom_score_6m = 50.0
+    else:
+        mom_score_6m = 50.0
+        
+    # Golden Cross: 50 EMA > 200 EMA -> 100, else 30
+    has_golden_cross = False
+    if not hist.empty and len(hist) >= 200:
+        try:
+            ema50 = hist["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            ema200 = hist["Close"].ewm(span=200, adjust=False).mean().iloc[-1]
+            has_golden_cross = bool(ema50 > ema200)
+        except Exception:
+            pass
+            
+    trend_score = 100.0 if has_golden_cross else 30.0
+    momentum_score = (mom_score_6m + trend_score) / 2.0
+
+    # COMPOSITE BOFA SCORE
+    composite = 0.25 * value_score + 0.25 * growth_score + 0.25 * quality_score + 0.25 * momentum_score
+    
+    return {
+        "bofa_val_peg": peg,
+        "bofa_val_fcf_yield": fcf_yield,
+        "bofa_val_pb_ratio": pb_ratio,
+        "bofa_gro_rev": rev_growth,
+        "bofa_gro_earn": earn_growth,
+        "bofa_qal_roe": roe,
+        "bofa_qal_de": de,
+        "bofa_mom_ret6m": ret_6m,
+        "bofa_mom_golden": has_golden_cross,
+        
+        "bofa_score_value": value_score,
+        "bofa_score_growth": growth_score,
+        "bofa_score_quality": quality_score,
+        "bofa_score_momentum": momentum_score,
+        "bofa_composite": composite
+    }
+
 # --- CACHED DATA FETCHING ---
 @st.cache_data(ttl=3600)
 def get_usdtry_rates(start_date, end_date):
@@ -368,13 +505,16 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime) -
         # PD/DD analizi
         pb_info = compute_historical_pb_custom(qbs, info, price_try)
 
-        # Bileşik Skor
+        # Bileşik Skor (Destek + PD/DD)
         composite = 0.4 * support_info["score"] + 0.6 * pb_info["pb_score"]
+        
+        # BofA Kantitatif Skorları hesapla
+        bofa = calculate_bofa_metrics(hist, info, pb_info)
 
         name = info.get("longName", ticker) or ticker
         sector = info.get("sector", "—") or "—"
 
-        return {
+        res = {
             "ticker":              ticker,
             "name":                name,
             "sector":              sector,
@@ -393,6 +533,8 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime) -
             "pb_samples":          pb_info.get("pb_samples", 0),
             "composite_score":     composite,
         }
+        res.update(bofa)
+        return res
     except Exception:
         return None
 
@@ -439,22 +581,33 @@ if "calc_usd_rate" not in st.session_state:
 
 # --- MAIN APP LAYOUT ---
 st.title("🔍 BIST Hisse Analiz Platformu")
-st.caption("BIST100 USD Bazlı Çok Yıllı Destek + Tarihsel PD/DD Analiz & Pozisyon Risk Hesaplayıcı")
+st.caption("BIST100 Çok Faktörlü Hisse Tarama & Pozisyon Risk Hesaplayıcı")
 
 # Create main tabs
 tab_scan, tab_calc = st.tabs(["🔍 BIST Hisse Tarayıcı", "📊 Pozisyon Hesaplayıcı"])
 
 # --- TAB 1: STOCK SCANNER ---
 with tab_scan:
-    # Sidebar Filters
-    st.sidebar.header("🎛️ Filtre Ayarları")
-    min_support = st.sidebar.slider("Min Destek Skoru", 0, 100, 30, help="0: Etkisiz, 100: En güçlü destek seviyesi")
-    min_pb = st.sidebar.slider("Min PD/DD Skoru", 0, 100, 60, help="Veri yoksa varsayılan 50p. Düşük PD/DD -> Yüksek skor")
-    min_touches = st.sidebar.slider("Min Dokunma (Destek)", 1, 10, 2, help="Seviyenin test edilme sayısı")
+    # Sidebar: Strategy & Filters
+    st.sidebar.header("🎛️ Analiz Parametreleri")
+    strategy = st.sidebar.selectbox("Analiz Stratejisi", ["Destek + PD/DD", "BofA Kantitatif Faktör"], help="Hisseleri analiz ederken ve puanlarken kullanılacak temel mantık modelini seçin.")
+    
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Filtre Ayarları")
+    
+    if strategy == "Destek + PD/DD":
+        min_support = st.sidebar.slider("Min Destek Skoru", 0, 100, 30, help="0: Etkisiz, 100: En güçlü destek seviyesi")
+        min_pb = st.sidebar.slider("Min PD/DD Skoru", 0, 100, 60, help="Veri yoksa varsayılan 50p. Düşük PD/DD -> Yüksek skor")
+        min_touches = st.sidebar.slider("Min Dokunma (Destek)", 1, 10, 2, help="Seviyenin test edilme sayısı")
+    else:
+        min_bofa = st.sidebar.slider("Min BofA Kompozit Skor", 0, 100, 50, help="4 faktörün (Değer, Büyüme, Kalite, Momentum) dengeli ortalama skoru.")
+        min_value = st.sidebar.slider("Min Değer Skoru", 0, 100, 30, help="PEG Oranı, Serbest Nakit Verimi ve PD/DD sapma ortalaması.")
+        min_growth = st.sidebar.slider("Min Büyüme Skoru", 0, 100, 30, help="Gelir ve Net Kar yıllık büyüme oranları.")
+        min_quality = st.sidebar.slider("Min Kalite Skoru", 0, 100, 30, help="Borçluluk seviyesi ve ROE verimi.")
     
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Veri Güncelliği")
-    st.sidebar.info("Bilanço verileri çeyreklik bazda Yahoo Finance üzerinden çekilmektedir. Fiyatlar günlük kapanış verileridir.")
+    st.sidebar.info("Bilanço ve mali veriler Yahoo Finance üzerinden çeyreklik bazda çekilir. Hareketli ortalamalar ve trend günlük güncellenir.")
 
     # Actions panel
     col_act1, col_act2 = st.columns([1, 2])
@@ -496,23 +649,29 @@ with tab_scan:
                 st.session_state.results[ticker] = res
                 success_count += 1
                 
-            # Polite delay to prevent rate limiting (HTTP 429) from Yahoo Finance
             time.sleep(0.3)
                 
         progress_bar.empty()
         status_text.success(f"✅ Tarama tamamlandı! {success_count} hisse analiz edildi.")
 
-    # Process Results
+    # Process & Display Results
     if st.session_state.results:
-        # Convert dictionary to DataFrame
         results_df = pd.DataFrame(list(st.session_state.results.values()))
         
-        # Apply Filters
-        filtered_df = results_df[
-            (results_df["support_score"] >= min_support) &
-            (results_df["pb_score"] >= min_pb) &
-            (results_df["support_touches"] >= min_touches)
-        ]
+        # Apply Filters based on active strategy
+        if strategy == "Destek + PD/DD":
+            filtered_df = results_df[
+                (results_df["support_score"] >= min_support) &
+                (results_df["pb_score"] >= min_pb) &
+                (results_df["support_touches"] >= min_touches)
+            ]
+        else:
+            filtered_df = results_df[
+                (results_df["bofa_composite"] >= min_bofa) &
+                (results_df["bofa_score_value"] >= min_value) &
+                (results_df["bofa_score_growth"] >= min_growth) &
+                (results_df["bofa_score_quality"] >= min_quality)
+            ]
         
         if filtered_df.empty:
             st.warning("⚠️ Seçilen filtrelere uyan hisse bulunamadı. Filtre limitlerini azaltmayı deneyebilirsiniz.")
@@ -521,12 +680,21 @@ with tab_scan:
             display_df = filtered_df.copy()
             display_df["current_try"] = display_df["current_try"].map("₺{:,.2f}".format)
             display_df["current_usd"] = display_df["current_usd"].map("${:,.4f}".format)
-            display_df["nearest_support_usd"] = display_df["nearest_support_usd"].map(lambda x: f"${x:,.4f}" if pd.notnull(x) else "—")
-            display_df["distance_pct"] = display_df["distance_pct"].map(lambda x: f"{x:.1f}%" if pd.notnull(x) else "—")
-            display_df["current_pb"] = display_df["current_pb"].map(lambda x: f"{x:.2f}x" if pd.notnull(x) else "—")
-            display_df["hist_avg_pb"] = display_df["hist_avg_pb"].map(lambda x: f"{x:.2f}x" if pd.notnull(x) else "—")
-            display_df["pb_ratio"] = display_df["pb_ratio"].map(lambda x: f"{x:.2f}×" if pd.notnull(x) else "—")
-            display_df["composite_score"] = display_df["composite_score"].map("{:.1f}".format)
+            
+            # Strategy Specific formatting
+            if strategy == "Destek + PD/DD":
+                display_df["nearest_support_usd"] = display_df["nearest_support_usd"].map(lambda x: f"${x:,.4f}" if pd.notnull(x) else "—")
+                display_df["distance_pct"] = display_df["distance_pct"].map(lambda x: f"{x:.1f}%" if pd.notnull(x) else "—")
+                display_df["current_pb"] = display_df["current_pb"].map(lambda x: f"{x:.2f}x" if pd.notnull(x) else "—")
+                display_df["hist_avg_pb"] = display_df["hist_avg_pb"].map(lambda x: f"{x:.2f}x" if pd.notnull(x) else "—")
+                display_df["pb_ratio"] = display_df["pb_ratio"].map(lambda x: f"{x:.2f}×" if pd.notnull(x) else "—")
+                display_df["composite_score"] = display_df["composite_score"].map("{:.1f}".format)
+            else:
+                display_df["bofa_composite"] = display_df["bofa_composite"].map("{:.1f}".format)
+                display_df["bofa_score_value"] = display_df["bofa_score_value"].map("{:.1f}".format)
+                display_df["bofa_score_growth"] = display_df["bofa_score_growth"].map("{:.1f}".format)
+                display_df["bofa_score_quality"] = display_df["bofa_score_quality"].map("{:.1f}".format)
+                display_df["bofa_score_momentum"] = display_df["bofa_score_momentum"].map("{:.1f}".format)
             
             # Layout: Table left, Detail Panel right
             col_tbl, col_det = st.columns([3, 1])
@@ -534,23 +702,40 @@ with tab_scan:
             with col_tbl:
                 st.subheader(f"Analiz Edilen Hisseler ({len(filtered_df)} / {len(results_df)} adet listeleniyor)")
                 
-                # Render interactive Table
-                st.dataframe(
-                    display_df[[
-                        "ticker", "name", "sector", "current_try", "current_usd", 
-                        "nearest_support_usd", "distance_pct", "support_touches", 
-                        "current_pb", "hist_avg_pb", "pb_ratio", "composite_score"
-                    ]].rename(columns={
-                        "ticker": "Hisse", "name": "Adı", "sector": "Sektör",
-                        "current_try": "Fiyat ₺", "current_usd": "USD Fiyat",
-                        "nearest_support_usd": "USD Destek", "distance_pct": "Uzaklık %",
-                        "support_touches": "Dokunma", "current_pb": "PD/DD",
-                        "hist_avg_pb": "PD/DD 5Y Ort.", "pb_ratio": "PD/DD Oran",
-                        "composite_score": "Bileşik Skor"
-                    }),
-                    use_container_width=True,
-                    hide_index=True
-                )
+                # Render interactive Table depending on strategy
+                if strategy == "Destek + PD/DD":
+                    st.dataframe(
+                        display_df[[
+                            "ticker", "name", "sector", "current_try", "current_usd", 
+                            "nearest_support_usd", "distance_pct", "support_touches", 
+                            "current_pb", "hist_avg_pb", "pb_ratio", "composite_score"
+                        ]].rename(columns={
+                            "ticker": "Hisse", "name": "Adı", "sector": "Sektör",
+                            "current_try": "Fiyat ₺", "current_usd": "USD Fiyat",
+                            "nearest_support_usd": "USD Destek", "distance_pct": "Uzaklık %",
+                            "support_touches": "Dokunma", "current_pb": "PD/DD",
+                            "hist_avg_pb": "PD/DD 5Y Ort.", "pb_ratio": "PD/DD Oran",
+                            "composite_score": "Bileşik Skor"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.dataframe(
+                        display_df[[
+                            "ticker", "name", "sector", "current_try", "current_usd",
+                            "bofa_composite", "bofa_score_value", "bofa_score_growth", 
+                            "bofa_score_quality", "bofa_score_momentum"
+                        ]].rename(columns={
+                            "ticker": "Hisse", "name": "Adı", "sector": "Sektör",
+                            "current_try": "Fiyat ₺", "current_usd": "USD Fiyat",
+                            "bofa_composite": "BofA Skoru", "bofa_score_value": "Değer",
+                            "bofa_score_growth": "Büyüme", "bofa_score_quality": "Kalite",
+                            "bofa_score_momentum": "Momentum"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
                 
                 # Download CSV
                 csv_data = filtered_df.to_csv(index=False, encoding="utf-8-sig")
@@ -568,12 +753,12 @@ with tab_scan:
                 
                 if selected_ticker:
                     r = st.session_state.results[selected_ticker]
-                    
-                    # Update selected ticker inside state
                     st.session_state.selected_ticker = selected_ticker
                     
-                    # Circular Gauge
-                    st.markdown(draw_svg_gauge(r["composite_score"]), unsafe_allow_html=True)
+                    # Circular Gauge based on strategy
+                    score_to_draw = r["composite_score"] if strategy == "Destek + PD/DD" else r["bofa_composite"]
+                    title_to_draw = "DESTEK SKORU" if strategy == "Destek + PD/DD" else "BOFA KOMPOZİT"
+                    st.markdown(draw_svg_gauge(score_to_draw, title_to_draw), unsafe_allow_html=True)
                     
                     st.markdown(f"### {r['name']}")
                     st.markdown(f"**Sektör:** `{r['sector']}` | **Yahoo Kodu:** `{r['ticker']}.IS`")
@@ -587,23 +772,66 @@ with tab_scan:
                     st.markdown(render_row("Fiyat (TRY)", f"{r['current_try']:,.2f}", "₺"), unsafe_allow_html=True)
                     st.markdown(render_row("Fiyat (USD)", f"{r['current_usd']:.4f}", "$"), unsafe_allow_html=True)
                     
-                    # Proximity support
-                    supp_val = f"${r['nearest_support_usd']:.4f}" if r['nearest_support_usd'] else "—"
-                    dist_val = f"{r['distance_pct']:.1f}%" if r['distance_pct'] else "—"
-                    st.markdown(render_row("USD Destek Seviyesi", supp_val, ""), unsafe_allow_html=True)
-                    st.markdown(render_row("Desteğe Uzaklık", dist_val, "", "yellow" if r['distance_pct'] and r['distance_pct'] < 5 else ""), unsafe_allow_html=True)
-                    st.markdown(render_row("Destek Temas Sayısı", f"{r['support_touches']}", " kez"), unsafe_allow_html=True)
-                    
-                    # Valuation P/B
-                    pb_val = f"{r['current_pb']:.2f}x" if r['current_pb'] else "—"
-                    pb_avg_val = f"{r['hist_avg_pb']:.2f}x" if r['hist_avg_pb'] else "—"
-                    pb_dev_val = f"{r['pb_ratio']:.2f}×" if r['pb_ratio'] else "—"
-                    st.markdown(render_row("PD/DD (Güncel)", pb_val, ""), unsafe_allow_html=True)
-                    st.markdown(render_row("PD/DD (5 Yıllık Ortalama)", pb_avg_val, ""), unsafe_allow_html=True)
-                    st.markdown(render_row("PD/DD Oranı (Güncel/Ortalama)", pb_dev_val, "ort.", "green" if r['pb_ratio'] and r['pb_ratio'] < 1 else "red" if r['pb_ratio'] and r['pb_ratio'] > 1.2 else ""), unsafe_allow_html=True)
-                    
-                    st.markdown(render_row("Destek Skoru", f"{r['support_score']:.0f}", "/ 100", "accent"), unsafe_allow_html=True)
-                    st.markdown(render_row("PD/DD Skoru", f"{r['pb_score']:.0f}", "/ 100", "accent"), unsafe_allow_html=True)
+                    if strategy == "Destek + PD/DD":
+                        # Original Details Panel
+                        supp_val = f"${r['nearest_support_usd']:.4f}" if r['nearest_support_usd'] else "—"
+                        dist_val = f"{r['distance_pct']:.1f}%" if r['distance_pct'] else "—"
+                        st.markdown(render_row("USD Destek Seviyesi", supp_val, ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Desteğe Uzaklık", dist_val, "", "yellow" if r['distance_pct'] and r['distance_pct'] < 5 else ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Destek Temas Sayısı", f"{r['support_touches']}", " kez"), unsafe_allow_html=True)
+                        
+                        pb_val = f"{r['current_pb']:.2f}x" if r['current_pb'] else "—"
+                        pb_avg_val = f"{r['hist_avg_pb']:.2f}x" if r['hist_avg_pb'] else "—"
+                        pb_dev_val = f"{r['pb_ratio']:.2f}×" if r['pb_ratio'] else "—"
+                        st.markdown(render_row("PD/DD (Güncel)", pb_val, ""), unsafe_allow_html=True)
+                        st.markdown(render_row("PD/DD (5 Yıllık Ortalama)", pb_avg_val, ""), unsafe_allow_html=True)
+                        st.markdown(render_row("PD/DD Oranı (Güncel/Ortalama)", pb_dev_val, "ort.", "green" if r['pb_ratio'] and r['pb_ratio'] < 1 else "red" if r['pb_ratio'] and r['pb_ratio'] > 1.2 else ""), unsafe_allow_html=True)
+                        
+                        st.markdown(render_row("Destek Skoru", f"{r['support_score']:.0f}", "/ 100", "accent"), unsafe_allow_html=True)
+                        st.markdown(render_row("PD/DD Skoru", f"{r['pb_score']:.0f}", "/ 100", "accent"), unsafe_allow_html=True)
+                    else:
+                        # BofA Factor Details Panel
+                        st.markdown(f"""
+                        <div class="factor-container">
+                            <div class="factor-item">
+                                <div class="factor-name">Değer</div>
+                                <div class="factor-score" style="color: #4a9eff;">{r['bofa_score_value']:.0f}</div>
+                            </div>
+                            <div class="factor-item">
+                                <div class="factor-name">Büyüme</div>
+                                <div class="factor-score" style="color: #a78bfa;">{r['bofa_score_growth']:.0f}</div>
+                            </div>
+                            <div class="factor-item">
+                                <div class="factor-name">Kalite</div>
+                                <div class="factor-score" style="color: #10d98a;">{r['bofa_score_quality']:.0f}</div>
+                            </div>
+                            <div class="factor-item">
+                                <div class="factor-name">Trend</div>
+                                <div class="factor-score" style="color: #f59e0b;">{r['bofa_score_momentum']:.0f}</div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Individual BofA metrics
+                        peg_val = f"{r['bofa_val_peg']:.2f}" if r['bofa_val_peg'] is not None else "—"
+                        fcf_val = f"{r['bofa_val_fcf_yield']*100:.1f}%" if r['bofa_val_fcf_yield'] is not None else "—"
+                        rev_val = f"{r['bofa_gro_rev']*100:.1f}%" if r['bofa_gro_rev'] is not None else "—"
+                        earn_val = f"{r['bofa_gro_earn']*100:.1f}%" if r['bofa_gro_earn'] is not None else "—"
+                        roe_val = f"{r['bofa_qal_roe']*100:.1f}%" if r['bofa_qal_roe'] is not None else "—"
+                        de_val = f"{r['bofa_qal_de']:.1f}%" if r['bofa_qal_de'] is not None else "—"
+                        
+                        ret_val = f"{r['bofa_mom_ret6m']*100:.1f}%" if r['bofa_mom_ret6m'] is not None else "—"
+                        gc_val = "Boğa (EMA50 > EMA200)" if r['bofa_mom_golden'] else "Ayı (EMA50 < EMA200)"
+                        gc_style = "green" if r['bofa_mom_golden'] else "red"
+                        
+                        st.markdown(render_row("PEG Oranı (F/K / Büyüme)", peg_val, "", "green" if r['bofa_val_peg'] and r['bofa_val_peg'] < 1 else ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Serbest Nakit Akış Verimi", fcf_val, "", "green" if r['bofa_val_fcf_yield'] and r['bofa_val_fcf_yield'] > 0.08 else ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Yıllık Gelir Büyümesi (YoY)", rev_val, ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Yıllık Net Kar Büyümesi (YoY)", earn_val, ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Özsermaye Karlılığı (ROE)", roe_val, "", "green" if r['bofa_qal_roe'] and r['bofa_qal_roe'] > 0.25 else ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Borç / Özsermaye (D/E)", de_val, ""), unsafe_allow_html=True)
+                        st.markdown(render_row("6 Aylık Fiyat Değişimi", ret_val, ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Uzun Vadeli Trend Yapısı", gc_val, "", gc_style), unsafe_allow_html=True)
                     
                     # Send to Calculator Button
                     if st.button("📊 Seçili Hisseyi Hesaplayıcıya Gönder", use_container_width=True, type="primary"):
@@ -631,7 +859,7 @@ with tab_calc:
         entry_price = st.number_input("Hisse Giriş Fiyatı (TRY)", min_value=0.01, value=float(st.session_state.calc_entry_price), step=0.05, format="%.2f")
         usd_rate = st.number_input("USD/TRY Döviz Kuru", min_value=1.0, value=float(st.session_state.calc_usd_rate), step=0.01, format="%.4f")
         
-        risk_pct = st.slider("Portföy Maksimum Kayıp Riski (%)", 0.1, 10.0, 2.0, step=0.1, help="Tek işlemde kaybetmeyi göze aldığınız portföy yüzdesi")
+        risk_pct = st.slider("Portföy Kayıp Riski (%)", 0.1, 10.0, 2.0, step=0.1, help="Tek işlemde kaybetmeyi göze aldığınız portföy yüzdesi")
         stop_pct = st.slider("Stop-Loss Yüzdesi (%)", 2.0, 15.0, 6.0, step=0.5, help="Giriş fiyatından stop fiyatına olan mesafe")
         rr_ratio = st.slider("Risk/Reward (T1) Oranı", 1.0, 5.0, 2.0, step=0.1, help="Risk başına beklenen getiri (örn: 2.0 ise stop mesafesinin 2 katı hedeftir)")
         
