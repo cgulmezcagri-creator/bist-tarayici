@@ -511,6 +511,12 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime) -
         # BofA Kantitatif Skorları hesapla
         bofa = calculate_bofa_metrics(hist, info, pb_info)
 
+        # Sıradışı hacim hesaplamaları
+        cash_vol = price_try["Close"] * hist["Volume"]
+        adv50 = float(cash_vol.rolling(50).mean().iloc[-1])
+        adv3 = float(cash_vol.rolling(3).mean().iloc[-1])
+        sma20_try = float(price_try["Close"].rolling(20).mean().iloc[-1])
+
         name = info.get("longName", ticker) or ticker
         sector = info.get("sector", "—") or "—"
 
@@ -532,6 +538,9 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime) -
             "pb_quality":          pb_info.get("pb_quality", "eksik"),
             "pb_samples":          pb_info.get("pb_samples", 0),
             "composite_score":     composite,
+            "adv50":               adv50,
+            "adv3":                adv3,
+            "sma20_try":           sma20_try,
         }
         res.update(bofa)
         return res
@@ -590,7 +599,7 @@ tab_scan, tab_calc, tab_single = st.tabs(["🔍 BIST Hisse Tarayıcı", "📊 Po
 with tab_scan:
     # Sidebar: Strategy & Filters
     st.sidebar.header("🎛️ Analiz Parametreleri")
-    strategy = st.sidebar.selectbox("Analiz Stratejisi", ["Destek + PD/DD", "BofA Kantitatif Faktör"], help="Hisseleri analiz ederken ve puanlarken kullanılacak temel mantık modelini seçin.")
+    strategy = st.sidebar.selectbox("Analiz Stratejisi", ["Destek + PD/DD", "BofA Kantitatif Faktör", "Hacim Kırılımı (Sıradışı Hacim)"], help="Hisseleri analiz ederken ve puanlarken kullanılacak temel mantık modelini seçin.")
     
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Filtre Ayarları")
@@ -599,6 +608,10 @@ with tab_scan:
         min_support = st.sidebar.slider("Min Destek Skoru", 0, 100, 30, help="0: Etkisiz, 100: En güçlü destek seviyesi")
         min_pb = st.sidebar.slider("Min PD/DD Skoru", 0, 100, 60, help="Veri yoksa varsayılan 50p. Düşük PD/DD -> Yüksek skor")
         min_touches = st.sidebar.slider("Min Dokunma (Destek)", 1, 10, 2, help="Seviyenin test edilme sayısı")
+    elif strategy == "Hacim Kırılımı (Sıradışı Hacim)":
+        min_surge_ratio = st.sidebar.slider("Min Hacim Artış Katsayısı (Kat)", 1.0, 10.0, 1.5, step=0.5, help="Son 3G Hacim / 50G Hacim oranı")
+        max_normal_rank = st.sidebar.slider("Normal Hacim Limit Sırası (Normalde Dışında)", 10, 50, 20, help="Hissenin normalde bu sıralamanın dışında (daha az hacimli) olması gerekir")
+        min_recent_rank = st.sidebar.slider("Son 3G Hacim Sıralama Limiti (Son 3G İçinde)", 10, 50, 20, help="Hissenin son 3 günde bu sıralamanın içinde (daha çok hacimli) olması gerekir")
     else:
         min_bofa = st.sidebar.slider("Min BofA Kompozit Skor", 0, 100, 50, help="4 faktörün (Değer, Büyüme, Kalite, Momentum) dengeli ortalama skoru.")
         min_value = st.sidebar.slider("Min Değer Skoru", 0, 100, 30, help="PEG Oranı, Serbest Nakit Verimi ve PD/DD sapma ortalaması.")
@@ -665,6 +678,22 @@ with tab_scan:
                 (results_df["pb_score"] >= min_pb) &
                 (results_df["support_touches"] >= min_touches)
             ]
+        elif strategy == "Hacim Kırılımı (Sıradışı Hacim)":
+            # Calculate rank over all scanned results
+            results_df["adv50_rank"] = results_df["adv50"].rank(ascending=False, method="min")
+            results_df["adv3_rank"] = results_df["adv3"].rank(ascending=False, method="min")
+            results_df["surge_ratio"] = results_df["adv3"] / results_df["adv50"]
+            results_df["sma20_dist_pct"] = (results_df["current_try"] - results_df["sma20_try"]) / results_df["sma20_try"] * 100
+            
+            # Apply Breakout filter
+            filtered_df = results_df[
+                (results_df["current_try"] > results_df["sma20_try"]) &
+                (results_df["adv50_rank"] > max_normal_rank) &
+                (results_df["adv3_rank"] <= min_recent_rank) &
+                (results_df["surge_ratio"] >= min_surge_ratio)
+            ]
+            # Sort by volume surge ratio descending
+            filtered_df = filtered_df.sort_values(by="surge_ratio", ascending=False)
         else:
             filtered_df = results_df[
                 (results_df["bofa_composite"] >= min_bofa) &
@@ -689,6 +718,13 @@ with tab_scan:
                 display_df["hist_avg_pb"] = display_df["hist_avg_pb"].map(lambda x: f"{x:.2f}x" if pd.notnull(x) else "—")
                 display_df["pb_ratio"] = display_df["pb_ratio"].map(lambda x: f"{x:.2f}×" if pd.notnull(x) else "—")
                 display_df["composite_score"] = display_df["composite_score"].map("{:.1f}".format)
+            elif strategy == "Hacim Kırılımı (Sıradışı Hacim)":
+                display_df["sma20_dist_pct"] = display_df["sma20_dist_pct"].map(lambda x: f"{x:.1f}%" if pd.notnull(x) else "—")
+                display_df["surge_ratio"] = display_df["surge_ratio"].map(lambda x: f"{x:.1f}x" if pd.notnull(x) else "—")
+                display_df["adv3"] = display_df["adv3"].map(lambda x: f"₺{x:,.0f}" if pd.notnull(x) else "—")
+                display_df["adv50"] = display_df["adv50"].map(lambda x: f"₺{x:,.0f}" if pd.notnull(x) else "—")
+                display_df["adv3_rank"] = display_df["adv3_rank"].map(lambda x: f"{x:.0f}" if pd.notnull(x) else "—")
+                display_df["adv50_rank"] = display_df["adv50_rank"].map(lambda x: f"{x:.0f}" if pd.notnull(x) else "—")
             else:
                 display_df["bofa_composite"] = display_df["bofa_composite"].map("{:.1f}".format)
                 display_df["bofa_score_value"] = display_df["bofa_score_value"].map("{:.1f}".format)
@@ -716,6 +752,22 @@ with tab_scan:
                             "support_touches": "Dokunma", "current_pb": "PD/DD",
                             "hist_avg_pb": "PD/DD 5Y Ort.", "pb_ratio": "PD/DD Oran",
                             "composite_score": "Bileşik Skor"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                elif strategy == "Hacim Kırılımı (Sıradışı Hacim)":
+                    st.dataframe(
+                        display_df[[
+                            "ticker", "name", "sector", "current_try", 
+                            "sma20_dist_pct", "surge_ratio", "adv3", "adv50", 
+                            "adv3_rank", "adv50_rank"
+                        ]].rename(columns={
+                            "ticker": "Hisse", "name": "Adı", "sector": "Sektör",
+                            "current_try": "Fiyat ₺", "sma20_dist_pct": "Ort. Üstünde (%)",
+                            "surge_ratio": "Hacim Artış Oranı (x)", "adv3": "3G Ort. Hacim ₺",
+                            "adv50": "50G Ort. Hacim ₺", "adv3_rank": "Son 3G Hacim Sırası",
+                            "adv50_rank": "Normal Hacim Sırası"
                         }),
                         use_container_width=True,
                         hide_index=True
@@ -756,8 +808,15 @@ with tab_scan:
                     st.session_state.selected_ticker = selected_ticker
                     
                     # Circular Gauge based on strategy
-                    score_to_draw = r["composite_score"] if strategy == "Destek + PD/DD" else r["bofa_composite"]
-                    title_to_draw = "DESTEK SKORU" if strategy == "Destek + PD/DD" else "BOFA KOMPOZİT"
+                    if strategy == "Destek + PD/DD":
+                        score_to_draw = r["composite_score"]
+                        title_to_draw = "DESTEK SKORU"
+                    elif strategy == "Hacim Kırılımı (Sıradışı Hacim)":
+                        score_to_draw = min(100.0, r.get("surge_ratio", 1.0) * 20.0)
+                        title_to_draw = "HACİM SKORU"
+                    else:
+                        score_to_draw = r["bofa_composite"]
+                        title_to_draw = "BOFA KOMPOZİT"
                     st.markdown(draw_svg_gauge(score_to_draw, title_to_draw), unsafe_allow_html=True)
                     
                     st.markdown(f"### {r['name']}")
@@ -789,6 +848,14 @@ with tab_scan:
                         
                         st.markdown(render_row("Destek Skoru", f"{r['support_score']:.0f}", "/ 100", "accent"), unsafe_allow_html=True)
                         st.markdown(render_row("PD/DD Skoru", f"{r['pb_score']:.0f}", "/ 100", "accent"), unsafe_allow_html=True)
+                    elif strategy == "Hacim Kırılımı (Sıradışı Hacim)":
+                        dist_val = f"{r.get('sma20_dist_pct', 0.0):.1f}%"
+                        st.markdown(render_row("20G Ortalamaya Uzaklık", dist_val, "", "green"), unsafe_allow_html=True)
+                        st.markdown(render_row("Hacim Artış Katsayısı", f"{r.get('surge_ratio', 1.0):.1f}x", "", "green" if r.get('surge_ratio', 1.0) > 2.0 else "yellow"), unsafe_allow_html=True)
+                        st.markdown(render_row("3 Günlük Ortalama Hacim", f"₺{r.get('adv3', 0.0):,.0f}", ""), unsafe_allow_html=True)
+                        st.markdown(render_row("50 Günlük Ortalama Hacim", f"₺{r.get('adv50', 0.0):,.0f}", ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Son 3G Hacim Sıralaması", f"{r.get('adv3_rank', 99):.0f} . sırada", "", "accent"), unsafe_allow_html=True)
+                        st.markdown(render_row("Normal Hacim Sıralaması", f"{r.get('adv50_rank', 99):.0f} . sırada", ""), unsafe_allow_html=True)
                     else:
                         # BofA Factor Details Panel
                         st.markdown(f"""
