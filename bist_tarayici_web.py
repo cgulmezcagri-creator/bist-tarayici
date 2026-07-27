@@ -584,7 +584,7 @@ st.title("🔍 BIST Hisse Analiz Platformu")
 st.caption("BIST100 Çok Faktörlü Hisse Tarama & Pozisyon Risk Hesaplayıcı")
 
 # Create main tabs
-tab_scan, tab_calc = st.tabs(["🔍 BIST Hisse Tarayıcı", "📊 Pozisyon Hesaplayıcı"])
+tab_scan, tab_calc, tab_single = st.tabs(["🔍 BIST Hisse Tarayıcı", "📊 Pozisyon Hesaplayıcı", "📈 Tekil Hisse Analizi"])
 
 # --- TAB 1: STOCK SCANNER ---
 with tab_scan:
@@ -970,6 +970,306 @@ with tab_calc:
             <div style="font-size:0.85rem; color:#64748b;">Eğer 20 işlem günü geçmesine rağmen hedefler veya stop seviyesi tetiklenmediyse işlemden manuel çıkın.</div>
         </div>
         """, unsafe_allow_html=True)
+
+# --- ONLINE TARGET PRICES FALLBACK SEARCH ---
+def fetch_online_targets_fallback(ticker):
+    import re
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    query = f"{ticker} hisse hedef fiyat aracı kurum 2026"
+    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(r.text, 'html.parser')
+        snippets = []
+        for a in soup.find_all('a', class_='result__snippet')[:4]:
+            text = a.text.strip()
+            text = re.sub(r'\s+', ' ', text)
+            snippets.append(text)
+        return snippets
+    except Exception:
+        return []
+
+def calc_atr_custom(df, n=14):
+    h, l, c = df['High'], df['Low'], df['Close']
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean().iloc[-1]
+
+# --- TAB 3: SINGLE STOCK ANALYSIS ---
+with tab_single:
+    st.subheader("📈 Tekil Hisse Derin Analiz Raporu")
+    st.markdown("İlgili BIST hisse kodunu girerek son 4 çeyreklik finansal durumunu, aracı kurum hedeflerini ve teknik alım/hedef seviyelerini anında görüntüleyin.")
+    
+    col_single_inp, col_single_btn = st.columns([3, 1])
+    with col_single_inp:
+        single_ticker = st.text_input("Hisse Kodu (Örn: THYAO, EREGL, FROTO, AKBNK):", value="AKBNK").upper().strip()
+    with col_single_btn:
+        st.write("###")
+        analyze_single = st.button("📈 Hisseyi Analiz Et", use_container_width=True, type="primary")
+
+    if analyze_single or (st.session_state.selected_ticker and st.session_state.selected_ticker == single_ticker):
+        ticker_symbol = single_ticker + ".IS" if not single_ticker.endswith(".IS") else single_ticker
+        
+        with st.spinner(f"⏳ {single_ticker} için veriler indiriliyor ve analiz ediliyor..."):
+            try:
+                # Get USD/TRY rate
+                start_date = datetime.now() - timedelta(days=365 * 5 + 60)
+                end_date = datetime.now()
+                usdtry_series = get_usdtry_rates(start_date, end_date)
+                
+                # Fetch Single Stock Raw Data
+                session = get_yf_session()
+                t = yf.Ticker(ticker_symbol, session=session)
+                hist = t.history(start=start_date, end=end_date, auto_adjust=True)
+                
+                if hist.empty or len(hist) < 60:
+                    st.error("❌ Hisse fiyat verisi alınamadı. Lütfen kodu doğru girdiğinizden emin olun (Örn: THYAO).")
+                else:
+                    info = {}
+                    try:
+                        info = t.info
+                    except Exception:
+                        pass
+                    
+                    name = info.get("longName", single_ticker) or single_ticker
+                    sector = info.get("sector", "—") or "—"
+                    
+                    if hasattr(hist.index, 'tz') and hist.index.tz is not None:
+                        hist.index = hist.index.tz_convert(None)
+                    
+                    price_try = hist[["Close"]].copy()
+                    current_try = float(price_try["Close"].iloc[-1])
+                    
+                    # Convert to USD
+                    if not usdtry_series.empty:
+                        rate_aligned = usdtry_series.reindex(price_try.index, method="ffill")
+                        price_usd = price_try["Close"] / rate_aligned
+                        current_usd_rate = float(rate_aligned.iloc[-1])
+                    else:
+                        current_usd_rate = float(info.get("regularMarketPrice", 47.0))
+                        price_usd = price_try["Close"] / current_usd_rate
+                    
+                    current_usd = float(price_usd.iloc[-1])
+                    
+                    # Calculate technical indicators
+                    atr_val = calc_atr_custom(hist, 14)
+                    atr_usd = atr_val / current_usd_rate
+                    
+                    # RSI
+                    delta_try = price_try['Close'].diff()
+                    rsi_try = 100 - 100/(1 + delta_try.clip(lower=0).rolling(14).mean() / (-delta_try).clip(lower=0).rolling(14).mean())
+                    rsi_try_val = rsi_try.iloc[-1]
+                    
+                    delta_usd = price_usd.diff()
+                    rsi_usd = 100 - 100/(1 + delta_usd.clip(lower=0).rolling(14).mean() / (-delta_usd).clip(lower=0).rolling(14).mean())
+                    rsi_usd_val = rsi_usd.iloc[-1]
+                    
+                    # Moving Averages (TRY)
+                    sma20_try = price_try['Close'].rolling(20).mean().iloc[-1]
+                    sma50_try = price_try['Close'].rolling(50).mean().iloc[-1]
+                    sma200_try = price_try['Close'].rolling(200).mean().iloc[-1]
+                    
+                    # Moving Averages (USD)
+                    sma20_usd = price_usd.rolling(20).mean().iloc[-1]
+                    sma50_usd = price_usd.rolling(50).mean().iloc[-1]
+                    sma200_usd = price_usd.rolling(200).mean().iloc[-1]
+                    
+                    # 52-Week High & Low
+                    df_1y_try = price_try.iloc[-252:]
+                    high_1y_try = df_1y_try['Close'].max()
+                    low_1y_try = df_1y_try['Close'].min()
+                    
+                    df_1y_usd = price_usd.iloc[-252:]
+                    high_1y_usd = df_1y_usd.max()
+                    low_1y_usd = df_1y_usd.min()
+                    
+                    # Fibonacci retracements (TRY)
+                    d_range_try = high_1y_try - low_1y_try
+                    fibs_try = {
+                        '0.0% (Zirve)': high_1y_try,
+                        '23.6%': high_1y_try - 0.236 * d_range_try,
+                        '38.2%': high_1y_try - 0.382 * d_range_try,
+                        '50.0%': high_1y_try - 0.500 * d_range_try,
+                        '61.8% (Altın)': high_1y_try - 0.618 * d_range_try,
+                        '78.6%': high_1y_try - 0.786 * d_range_try,
+                        '100% (Dip)': low_1y_try
+                    }
+                    
+                    # Fibonacci retracements (USD)
+                    d_range_usd = high_1y_usd - low_1y_usd
+                    fibs_usd = {
+                        '0.0% (Zirve)': high_1y_usd,
+                        '23.6%': high_1y_usd - 0.236 * d_range_usd,
+                        '38.2%': high_1y_usd - 0.382 * d_range_usd,
+                        '50.0%': high_1y_usd - 0.500 * d_range_usd,
+                        '61.8% (Altın)': high_1y_usd - 0.618 * d_range_usd,
+                        '78.6%': high_1y_usd - 0.786 * d_range_usd,
+                        '100% (Dip)': low_1y_usd
+                    }
+                    
+                    # --- UI RENDER START ---
+                    st.success(f"✅ {name} ({single_ticker}) Analiz Edildi.")
+                    
+                    # Top Metrics
+                    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                    with col_m1:
+                        st.metric("Son Fiyat (TRY)", f"₺{current_try:,.2f}")
+                    with col_m2:
+                        st.metric("Son Fiyat (USD)", f"${current_usd:.4f}", f"Kur: {current_usd_rate:.4f}")
+                    with col_m3:
+                        st.metric("RSI (TRY / USD)", f"{rsi_try_val:.1f} / {rsi_usd_val:.1f}")
+                    with col_m4:
+                        st.metric("Sektör", sector)
+                        
+                    st.markdown("---")
+                    
+                    # Quarterlies and Analyst recommendations
+                    col_left, col_right = st.columns([1, 1])
+                    
+                    with col_left:
+                        st.markdown("### 📊 Son 4 Çeyreklik Finansal Sonuçlar")
+                        try:
+                            inc = t.quarterly_income_stmt
+                            net_income_row = None
+                            for key in ["Net Income", "Net Income From Continuing Operation Net Minority Interest", "Normalized Income", "Net Income Common Stockholders"]:
+                                if key in inc.index:
+                                    net_income_row = inc.loc[key]
+                                    break
+                            
+                            revenue_row = None
+                            for key in ["Total Revenue", "Operating Revenue"]:
+                                if key in inc.index:
+                                    revenue_row = inc.loc[key]
+                                    break
+                                    
+                            if net_income_row is not None or revenue_row is not None:
+                                df_fin = pd.DataFrame(index=inc.columns)
+                                if net_income_row is not None:
+                                    df_fin["Net Kar (Milyar ₺)"] = net_income_row.values / 1e9
+                                if revenue_row is not None:
+                                    df_fin["Hasılat (Milyar ₺)"] = revenue_row.values / 1e9
+                                    
+                                df_fin = df_fin.dropna(how='all').sort_index()
+                                
+                                # Plot bar chart
+                                st.bar_chart(df_fin)
+                                
+                                # Render Table
+                                st.dataframe(df_fin.rename(columns={
+                                    "Net Kar (Milyar ₺)": "Net Kâr (Milyar ₺)",
+                                    "Hasılat (Milyar ₺)": "Hasılat (Milyar ₺)"
+                                }), use_container_width=True)
+                            else:
+                                st.info("Bu hisse için çeyreklik bilanço verisi bulunamadı.")
+                        except Exception as e:
+                            st.warning(f"Bilanço verisi yüklenirken hata: {e}")
+                            
+                    with col_right:
+                        st.markdown("### 🎯 Aracı Kurum Hedef Fiyatları")
+                        
+                        target_mean = info.get("targetMeanPrice")
+                        target_high = info.get("targetHighPrice")
+                        target_low = info.get("targetLowPrice")
+                        opinions = info.get("numberOfAnalystOpinions")
+                        rec_key = info.get("recommendationKey", "—")
+                        
+                        if target_mean:
+                            st.markdown(f"**Ortalama Hedef Fiyat:** `₺{target_mean:,.2f}`")
+                            st.markdown(f"**En Yüksek Hedef:** `₺{target_high:,.2f}`")
+                            st.markdown(f"**En Düşük Hedef:** `₺{target_low:,.2f}`")
+                            st.markdown(f"**Analist Sayısı:** `{opinions}`")
+                            st.markdown(f"**Konsensüs Tavsiyesi:** `{rec_key.upper()}`")
+                            
+                            potential = (target_mean - current_try) / current_try * 100
+                            st.markdown(f"**Potansiyel Getiri:** `%{potential:.1f}`")
+                        else:
+                            st.info("Yahoo Finance üzerinde bu hisse için aracı kurum hedef fiyat verisi bulunmamaktadır.")
+                            
+                        # Web search fallback for target prices
+                        st.markdown("**Web Arama Sonuçları (Tahminler & Haberler):**")
+                        fallback_snippets = fetch_online_targets_fallback(single_ticker)
+                        if fallback_snippets:
+                            for snip in fallback_snippets:
+                                st.markdown(f"- *{snip}*")
+                        else:
+                            st.markdown("- *İnternet arama sonuçları alınamadı.*")
+                            
+                    st.markdown("---")
+                    
+                    # Technicals & Buy Zone & Targets
+                    st.markdown("### 🛠️ Teknik Analiz Seviyeleri ve Yatırım Stratejisi")
+                    
+                    # Calculate Buy Zone and target prices programmatically
+                    # Buy Zone TRY
+                    support_try = fibs_try['78.6%']
+                    if current_try < support_try:
+                        support_try = low_1y_try
+                    
+                    entry_low_try = support_try * 0.98
+                    entry_high_try = support_try + 0.5 * atr_val
+                    stop_try = support_try - 1.5 * atr_val
+                    
+                    # Buy Zone USD
+                    support_usd = fibs_usd['78.6%']
+                    if current_usd < support_usd:
+                        support_usd = low_1y_usd
+                        
+                    entry_low_usd = support_usd * 0.98
+                    entry_high_usd = support_usd + 0.5 * atr_usd
+                    stop_usd = support_usd - 1.5 * atr_usd
+                    
+                    # 6-Month Target
+                    target_6m_usd = max(sma200_usd, fibs_usd['50.0%'])
+                    if target_6m_usd < current_usd * 1.15:
+                        target_6m_usd = current_usd * 1.20
+                    target_6m_try = target_6m_usd * current_usd_rate
+                    
+                    # 12-Month Target
+                    if target_mean:
+                        target_12m_try = target_mean
+                        target_12m_usd = target_mean / current_usd_rate
+                    else:
+                        target_12m_usd = max(high_1y_usd, fibs_usd['23.6%'] * 1.1)
+                        if target_12m_usd < current_usd * 1.30:
+                            target_12m_usd = current_usd * 1.50
+                        target_12m_try = target_12m_usd * current_usd_rate
+                        
+                    # UI columns for Technical levels
+                    col_t1, col_t2 = st.columns(2)
+                    with col_t1:
+                        st.markdown("#### ₺ TL Bazlı Seviyeler")
+                        st.markdown(f"**52 Haftalık Zirve / Dip:** `₺{high_1y_try:,.2f}` / `₺{low_1y_try:,.2f}`")
+                        st.markdown(f"**SMA20 / SMA50 / SMA200:** `₺{sma20_try:,.2f}` / `₺{sma50_try:,.2f}` / `₺{sma200_try:,.2f}`")
+                        st.markdown(f"**Fibonacci %61.8 (Altın Oran):** `₺{fibs_try['61.8% (Altın)']:,.2f}`")
+                        st.markdown(f"**Fibonacci %78.6 Desteği:** `₺{fibs_try['78.6%']:,.2f}`")
+                        
+                        st.markdown("##### 📥 Yatırım Stratejisi (TRY)")
+                        st.markdown(f"🔴 **Kademeli Alım Bölgesi:** `₺{entry_low_try:,.2f} – ₺{entry_high_try:,.2f}`")
+                        st.markdown(f"🚫 **Stop-Loss (Zarar Kes):** `₺{stop_try:,.2f}`")
+                        st.markdown(f"🎯 **6 Aylık Hedef Fiyat:** `₺{target_6m_try:,.2f}` (Potansiyel: `%{ (target_6m_try - current_try)/current_try*100:.1f}`)")
+                        st.markdown(f"🏆 **12 Aylık Hedef Fiyat:** `₺{target_12m_try:,.2f}` (Potansiyel: `%{ (target_12m_try - current_try)/current_try*100:.1f}`)")
+                        
+                    with col_t2:
+                        st.markdown("#### $ USD Bazlı Seviyeler")
+                        st.markdown(f"**52 Haftalık Zirve / Dip:** `${high_1y_usd:,.4f}` / `${low_1y_usd:,.4f}`")
+                        st.markdown(f"**SMA20 / SMA50 / SMA200:** `${sma20_usd:,.4f}` / `${sma50_usd:,.4f}` / `${sma200_usd:,.4f}`")
+                        st.markdown(f"**Fibonacci %61.8 (Altın Oran):** `${fibs_usd['61.8% (Altın)']:,.4f}`")
+                        st.markdown(f"**Fibonacci %78.6 Desteği:** `${fibs_usd['78.6%']:,.4f}`")
+                        
+                        st.markdown("##### 📥 Yatırım Stratejisi (USD)")
+                        st.markdown(f"🔴 **Kademeli Alım Bölgesi:** `${entry_low_usd:,.4f} – ${entry_high_usd:,.4f}`")
+                        st.markdown(f"🚫 **Stop-Loss (Zarar Kes):** `${stop_usd:,.4f}`")
+                        st.markdown(f"🎯 **6 Aylık Hedef Fiyat:** `${target_6m_usd:,.4f}` (Potansiyel: `%{ (target_6m_usd - current_usd)/current_usd*100:.1f}`)")
+                        st.markdown(f"🏆 **12 Aylık Hedef Fiyat:** `${target_12m_usd:,.4f}` (Potansiyel: `%{ (target_12m_usd - current_usd)/current_usd*100:.1f}`)")
+
+                    st.markdown("---")
+                    # Send to position calculator
+                    if st.button("📊 Bu Hisseyi Pozisyon Hesaplayıcıya Aktar", use_container_width=True):
+                        st.session_state.calc_entry_price = current_try
+                        st.session_state.calc_usd_rate = current_usd_rate
+                        st.success(f"✅ {single_ticker} giriş fiyatı (₺{current_try:,.2f}) ve USD kuru ({current_usd_rate:.4f}) Pozisyon Hesaplayıcı'ya başarıyla gönderildi!")
+            except Exception as ex:
+                st.error(f"Hata oluştu: {ex}")
 
 # --- FOOTER ---
 st.markdown("---")
