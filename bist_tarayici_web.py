@@ -594,23 +594,41 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime, s
                 current_dir = os.path.dirname(os.path.abspath(__file__))
                 if current_dir not in sys.path:
                     sys.path.append(current_dir)
-                from optimum_buy_analyzer import StrategyOptimizer
+                from optimum_buy_analyzer import StrategyOptimizer, calculate_technical_score, IndicatorCalculator
                 
-                # Setup indicators df for optimization
+                # Setup indicators df for optimization exactly like optimum_buy_analyzer
                 df_indicators = hist.copy()
-                df_indicators['ATR'] = tr.rolling(min(len(tr), 14)).mean()
-                df_indicators['RSI'] = 100 - (100 / (1 + gain / (loss + 1e-9)))
-                df_indicators['MACD_Hist'] = macd_hist
-                df_indicators['BB_Upper'] = bb_middle + 2 * bb_std
-                df_indicators['BB_Lower'] = bb_middle - 2 * bb_std
-                df_indicators['EMA200'] = c_s.ewm(span=200, adjust=False).mean()
+                h_c, l_c, c_c = df_indicators['High'], df_indicators['Low'], df_indicators['Close']
+                tr_c = pd.concat([h_c - l_c, (h_c - c_c.shift(1)).abs(), (l_c - c_c.shift(1)).abs()], axis=1).max(axis=1)
+                df_indicators['ATR'] = tr_c.rolling(14).mean()
+                
+                delta_c = c_c.diff()
+                gain_c = (delta_c.clip(lower=0)).rolling(14).mean()
+                loss_c = (-delta_c.clip(upper=0)).rolling(14).mean()
+                rs_c = gain_c / (loss_c + 1e-9)
+                df_indicators['RSI'] = 100 - (100 / (1 + rs_c))
+                
+                ema_fast_c = c_c.ewm(span=12, adjust=False).mean()
+                ema_slow_c = c_c.ewm(span=26, adjust=False).mean()
+                macd_line_c = ema_fast_c - ema_slow_c
+                signal_line_c = macd_line_c.ewm(span=9, adjust=False).mean()
+                df_indicators['MACD_Hist'] = macd_line_c - signal_line_c
+                
+                bb_middle_c = c_c.rolling(20).mean()
+                bb_std_c = c_c.rolling(20).std()
+                df_indicators['BB_Upper'] = bb_middle_c + 2 * bb_std_c
+                df_indicators['BB_Lower'] = bb_middle_c - 2 * bb_std_c
+                
+                df_indicators['EMA200'] = c_c.ewm(span=200, adjust=False).mean()
                 df_indicators = df_indicators.dropna()
                 
-                # Son 500 günde (2 yılda) optimize et
+                # Find pivots on Low prices with window=20 (TRY)
+                pivots_20 = IndicatorCalculator.find_pivot_lows(df_indicators, window=20)
+                
+                # Slice to 500 trading days
                 df_opt = df_indicators.iloc[-500:] if len(df_indicators) >= 500 else df_indicators
                 
-                # Get best parameters (using window=20 for pivots)
-                pivots_20 = find_pivot_lows(price_usd, window=20)
+                # Optimize
                 best_params, opt_results = StrategyOptimizer.optimize(df_opt, pivots_20, show_progress=False)
                 
                 opt_w_sup = best_params["w_support"]
@@ -621,7 +639,30 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime, s
                 opt_buy_threshold = best_params["buy_threshold"]
                 opt_sl_atr = best_params["sl_atr"]
                 opt_tp_atr = best_params["tp_atr"]
-            except Exception:
+                opt_tolerance = best_params["support_tolerance"]
+                
+                # Calculate final support levels using optimized tolerance
+                all_zones = IndicatorCalculator.cluster_support_zones(pivots_20, tolerance=opt_tolerance)
+                supports_below = [z for z in all_zones if z["price"] <= current_try]
+                nearest_sup_try = None
+                if supports_below:
+                    nearest_sup_try = min(supports_below, key=lambda z: current_try - z["price"])["price"]
+                
+                # Calculate Score
+                last_row = df_opt.iloc[-1]
+                prev_row = df_opt.iloc[-2] if len(df_opt) > 1 else None
+                score_res = calculate_technical_score(
+                    last_row, prev_row, nearest_sup_try,
+                    opt_w_sup, opt_w_rsi, opt_w_macd, opt_w_bb, opt_w_ema
+                )
+                opt_composite_score = score_res["composite"]
+                
+                # Calculate ATR on latest row
+                atr_val = float(last_row['ATR'])
+                rsi_val = float(last_row['RSI'])
+                
+            except Exception as ex:
+                # Fallback to default average optimized parameters if optimization fails
                 opt_w_sup = 0.60
                 opt_w_rsi = 0.15
                 opt_w_macd = 0.15
@@ -630,7 +671,12 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime, s
                 opt_buy_threshold = 60.0
                 opt_sl_atr = 2.0
                 opt_tp_atr = 3.0
+                atr_val = current_try * 0.03
+                rsi_val = 50.0
+                nearest_sup_try = current_try * 0.95
+                opt_composite_score = 50.0
         else:
+            # For other strategies, use default fast computation
             opt_w_sup = 0.60
             opt_w_rsi = 0.15
             opt_w_macd = 0.15
@@ -639,19 +685,54 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime, s
             opt_buy_threshold = 60.0
             opt_sl_atr = 2.0
             opt_tp_atr = 3.0
-        
-        opt_composite_score = (
-            opt_w_sup * score_sup +
-            opt_w_rsi * score_rsi +
-            opt_w_macd * score_macd +
-            opt_w_bb * score_bb +
-            opt_w_ema * score_ema
-        ) / (opt_w_sup + opt_w_rsi + opt_w_macd + opt_w_bb + opt_w_ema)
-        
-        # Buy Zone (convert support from USD to TRY)
-        usd_rate = current_try / current_usd if current_usd > 0 else 38.0
-        nearest_sup_usd = support_info.get("nearest_support")
-        nearest_sup_try = nearest_sup_usd * usd_rate if nearest_sup_usd is not None else None
+            
+            # Simple calculations for fast scan
+            atr_val = float(tr.rolling(min(len(tr), 14)).mean().iloc[-1]) if len(tr) > 0 else current_try * 0.03
+            rsi_val = float((100 - (100 / (1 + rs))).iloc[-1]) if len(rs) > 0 else 50.0
+            
+            # support score (use default support info try)
+            usd_rate = current_try / current_usd if current_usd > 0 else 38.0
+            nearest_sup_usd = support_info.get("nearest_support")
+            nearest_sup_try = nearest_sup_usd * usd_rate if nearest_sup_usd is not None else None
+            
+            score_sup = support_info["score"]
+            # 2. RSI Score
+            score_rsi = 0.0
+            if rsi_val <= 30:
+                score_rsi = 100.0
+            elif rsi_val <= 45:
+                score_rsi = 100.0 - (rsi_val - 30) * 5.0
+            elif rsi_val <= 65:
+                score_rsi = 25.0
+                
+            # 3. MACD Score
+            score_macd = 0.0
+            if curr_macd_hist > 0:
+                score_macd = 100.0 if curr_macd_hist > prev_macd_hist else 70.0
+            else:
+                score_macd = 50.0 if curr_macd_hist > prev_macd_hist else 10.0
+                
+            # 4. Bollinger Score
+            score_bb = 0.0
+            if bb_upper > bb_lower:
+                pct_bb = (current_try - bb_lower) / (bb_upper - bb_lower)
+                if pct_bb <= 0.1:
+                    score_bb = 100.0
+                elif pct_bb <= 0.5:
+                    score_bb = 100.0 - (pct_bb - 0.1) * 200.0
+                else:
+                    score_bb = 10.0
+                    
+            # 5. EMA Score
+            score_ema = 100.0 if current_try > ema200 else 30.0
+            
+            opt_composite_score = (
+                opt_w_sup * score_sup +
+                opt_w_rsi * score_rsi +
+                opt_w_macd * score_macd +
+                opt_w_bb * score_bb +
+                opt_w_ema * score_ema
+            ) / (opt_w_sup + opt_w_rsi + opt_w_macd + opt_w_bb + opt_w_ema)
         
         if nearest_sup_try is not None:
             buy_zone_low = nearest_sup_try
