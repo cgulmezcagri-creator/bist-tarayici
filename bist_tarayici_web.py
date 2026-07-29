@@ -593,7 +593,7 @@ st.title("🔍 BIST Hisse Analiz Platformu")
 st.caption("BIST100 Çok Faktörlü Hisse Tarama & Pozisyon Risk Hesaplayıcı")
 
 # Create main tabs
-tab_scan, tab_calc, tab_single = st.tabs(["🔍 BIST Hisse Tarayıcı", "📊 Pozisyon Hesaplayıcı", "📈 Tekil Hisse Analizi"])
+tab_scan, tab_calc, tab_single, tab_opt = st.tabs(["🔍 BIST Hisse Tarayıcı", "📊 Pozisyon Hesaplayıcı", "📈 Tekil Hisse Analizi", "🎯 Optimum Alım Noktası"])
 
 # --- TAB 1: STOCK SCANNER ---
 with tab_scan:
@@ -1337,6 +1337,132 @@ with tab_single:
                         st.success(f"✅ {single_ticker} giriş fiyatı (₺{current_try:,.2f}) ve USD kuru ({current_usd_rate:.4f}) Pozisyon Hesaplayıcı'ya başarıyla gönderildi!")
             except Exception as ex:
                 st.error(f"Hata oluştu: {ex}")
+
+# --- TAB 4: OPTIMUM BUY POINT ANALYSIS ---
+with tab_opt:
+    st.subheader("🎯 Optimum Alım Noktası ve Teknik Optimizasyon")
+    st.markdown("Hisse senedinin geçmiş verilerini tarayarak en yüksek Sharpe oranını ve başarı yüzdesini sağlayan **optimum ağırlıkları ve stop/hedef çarpanlarını** hesaplar.")
+    
+    col_opt_inp, col_opt_yr, col_opt_btn = st.columns([2, 1, 1])
+    with col_opt_inp:
+        opt_ticker = st.text_input("Hisse Kodu (Örn: THYAO, EREGL, ASELS, BIMAS):", value="THYAO", key="opt_ticker_input").upper().strip()
+    with col_opt_yr:
+        opt_years = st.selectbox("Analiz Süresi (Yıl):", [1, 2, 3, 5], index=1)
+    with col_opt_btn:
+        st.write("###")
+        run_opt = st.button("🎯 Optimizasyonu Başlat", use_container_width=True, type="primary")
+        
+    if run_opt:
+        ticker_symbol = opt_ticker + ".IS" if not opt_ticker.endswith(".IS") else opt_ticker
+        
+        with st.spinner(f"⏳ {opt_ticker} için veriler indiriliyor ve en iyi parametreler hesaplanıyor (Grid Search)..."):
+            try:
+                # Import the analysis engine
+                from optimum_buy_analyzer import run_analysis_for_ticker
+                
+                # Setup dates
+                end_date = datetime.now().strftime("%Y-%m-%d")
+                start_date = (datetime.now() - timedelta(days=opt_years * 365)).strftime("%Y-%m-%d")
+                
+                res = run_analysis_for_ticker(ticker_symbol, start_date, end_date)
+                
+                if not res:
+                    st.error("❌ Veri alınamadı veya optimizasyon başarısız oldu. Lütfen geçerli bir BIST kodu girdiğinizden emin olun.")
+                else:
+                    # Let's display the signal gauge & summary
+                    col_res1, col_res2 = st.columns([1, 2])
+                    
+                    with col_res1:
+                        # Draw Gauge
+                        fig_gauge = draw_svg_gauge(res["score"], title="BİRLEŞİK TEKNİK SKOR")
+                        st.markdown(fig_gauge, unsafe_allow_html=True)
+                        
+                        # Signal Box
+                        sig = res["signal"]
+                        if sig == "ALIM SİNYALİ":
+                            st.success(f"🟢 **Durum:** {sig}")
+                        elif "ALIM BÖLGESİNDE" in sig:
+                            st.warning(f"🟡 **Durum:** {sig}")
+                        elif "AŞIRI SATIM" in sig:
+                            st.info(f"🔵 **Durum:** {sig}")
+                        else:
+                            st.info(f"⚪ **Durum:** {sig}")
+                            
+                        st.markdown(f"**Açıklama:** {res['description']}")
+                        
+                    with col_res2:
+                        st.markdown("### 🛒 Optimum Seviyeler ve Hedefler")
+                        bz = res["buy_zone"]
+                        
+                        col_l1, col_l2 = st.columns(2)
+                        with col_l1:
+                            st.metric("Son Fiyat", f"₺{res['close']:.2f}")
+                            st.metric("Optimum Alım Bölgesi", f"₺{bz[0]:.2f} - ₺{bz[1]:.2f}")
+                            if res["nearest_support"]:
+                                st.metric("En Yakın Güçlü Dip (Destek)", f"₺{res['nearest_support']:.2f}")
+                        with col_l2:
+                            st.metric("🚫 Zarar Durdur (Stop-Loss)", f"₺{res['stop_loss']:.2f}")
+                            st.metric("🎯 Kar Al 1 (T1 Hedefi)", f"₺{res['take_profit_t1']:.2f}")
+                            st.metric("🏆 Kar Al 2 (T2 Hedefi)", f"₺{res['take_profit_t2']:.2f}")
+                            
+                    st.markdown("---")
+                    
+                    # Backtest Results & Best parameters
+                    col_b1, col_b2 = st.columns(2)
+                    
+                    with col_b1:
+                        st.markdown("### 📈 Optimize Strateji Başarım Metrikleri (Backtest)")
+                        om = res["opt_metrics"]
+                        
+                        st.markdown(f"""
+                        - **Toplam Strateji Getirisi:** `%{om['total_return']:.1f}`
+                        - **İşlem Başarı Oranı (Win Rate):** `%{om['win_rate']:.1f}`
+                        - **Kâr Faktörü (Profit Factor):** `{om['profit_factor']:.2f}`
+                        - **Maksimum Zarar (Max Drawdown):** `%{om['max_drawdown']:.1f}`
+                        - **Sharpe Oranı (Risk/Ödül):** `{om['sharpe']:.2f}`
+                        - **Toplam Gerçekleşen İşlem Sayısı:** `{om['trades_count']}`
+                        """)
+                        
+                    with col_b2:
+                        st.markdown("### 🛠️ En İyi Koşul Parametreleri")
+                        bp = res["best_params"]
+                        
+                        st.markdown(f"""
+                        - **Destek Yakınlığı Ağırlığı (Weight Support):** `%{bp['w_support']*100:.0f}`
+                        - **RSI Eki / MACD Eki Ağırlığı:** `%{bp['w_rsi']*100:.0f}` / `%{bp['w_macd']*100:.0f}`
+                        - **Bollinger / EMA Ağırlığı:** `%{bp['w_bb']*100:.0f}` / `%{bp['w_ema']*100:.0f}`
+                        - **Alım Kararı Skor Eşiği (Buy Threshold):** `{bp['buy_threshold']}`
+                        - **Zarar Kes Çarpanı (Stop-Loss Mult):** `{bp['sl_atr']:.1f}x ATR`
+                        - **Kâr Al Çarpanı (Take-Profit Mult):** `{bp['tp_atr']:.1f}x ATR`
+                        """)
+                        
+                    # Extra: Clustered Support Zones
+                    st.markdown("### 🏛️ Tarihsel Güçlü Yatay Destek Seviyeleri (Clustered Pivots)")
+                    zones = res["all_supports"]
+                    if zones:
+                        zones_sorted = sorted(zones, key=lambda x: x["touches"], reverse=True)
+                        zone_data = [{
+                            "Destek Seviyesi (₺)": f"₺{z['price']:.2f}",
+                            "Tarihsel Test Sayısı (Dokunma)": z["touches"],
+                            "Son Test Edilme Tarihi": z["last_date"].strftime("%Y-%m-%d")
+                        } for z in zones_sorted[:10]]
+                        st.table(pd.DataFrame(zone_data))
+                    else:
+                        st.info("Bu periyotta teyit edilmiş destek pivotu bulunamadı.")
+                        
+                    # Send to Position Calculator
+                    st.markdown("---")
+                    if st.button("📊 Bu Optimum Seviyeleri Pozisyon Hesaplayıcıya Aktar", use_container_width=True, key="opt_to_calc_btn"):
+                        st.session_state.calc_entry_price = float(bz[1])
+                        try:
+                            usdtry_rates = get_usdtry_rates(datetime.now()-timedelta(days=7), datetime.now())
+                            st.session_state.calc_usd_rate = float(usdtry_rates.iloc[-1])
+                        except Exception:
+                            st.session_state.calc_usd_rate = 47.0
+                            
+                        st.success(f"✅ {opt_ticker} optimum alım seviyesi (₺{bz[1]:.2f}) ve USD kuru ({st.session_state.calc_usd_rate:.2f}) Pozisyon Hesaplayıcı'ya başarıyla gönderildi! Pozisyon Hesaplayıcı sekmesine geçiş yapabilirsiniz.")
+            except Exception as ex:
+                st.error(f"Optimizasyon ve analiz sırasında hata oluştu: {ex}")
 
 # --- FOOTER ---
 st.markdown("---")
