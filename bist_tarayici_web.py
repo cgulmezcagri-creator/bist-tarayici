@@ -1,5 +1,9 @@
 import sys
 import os
+# Proje dizinini sys.path'e ekle (Modül yükleme sorunlarını çözmek için)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 import math
 import csv
 import time
@@ -1467,7 +1471,9 @@ with tab_opt:
                             
                         st.success(f"✅ {opt_ticker} optimum alım seviyesi (₺{bz[1]:.2f}) ve USD kuru ({st.session_state.calc_usd_rate:.2f}) Pozisyon Hesaplayıcı'ya başarıyla gönderildi! Pozisyon Hesaplayıcı sekmesine geçiş yapabilirsiniz.")
             except Exception as ex:
+                import traceback
                 st.error(f"Optimizasyon ve analiz sırasında hata oluştu: {ex}")
+                st.code(traceback.format_exc())
 
 # --- FOOTER ---
 st.markdown("---")
