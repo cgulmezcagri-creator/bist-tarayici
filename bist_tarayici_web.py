@@ -521,6 +521,116 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime) -
         adv3 = float(cash_vol.rolling(3).mean().iloc[-1])
         sma20_try = float(price_try["Close"].rolling(20).mean().iloc[-1])
 
+        # --- OPTIMUM BUY POINT CALCULATIONS (Using default optimized weights) ---
+        # Get latest Close and High/Low
+        h, l, c_s = hist['High'], hist['Low'], hist['Close']
+        tr = pd.concat([h - l, (h - c_s.shift(1)).abs(), (l - c_s.shift(1)).abs()], axis=1).max(axis=1)
+        atr_val = float(tr.rolling(min(len(tr), 14)).mean().iloc[-1]) if len(tr) > 0 else current_try * 0.03
+        
+        # RSI(14)
+        delta = c_s.diff()
+        gain = (delta.clip(lower=0)).rolling(min(len(delta), 14)).mean()
+        loss = (-delta.clip(upper=0)).rolling(min(len(delta), 14)).mean()
+        rs = gain / (loss + 1e-9)
+        rsi_val = float((100 - (100 / (1 + rs))).iloc[-1]) if len(rs) > 0 else 50.0
+        
+        # MACD(12,26,9)
+        ema_fast = c_s.ewm(span=12, adjust=False).mean()
+        ema_slow = c_s.ewm(span=26, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = macd_line - signal_line
+        curr_macd_hist = float(macd_hist.iloc[-1]) if len(macd_hist) > 0 else 0.0
+        prev_macd_hist = float(macd_hist.iloc[-2]) if len(macd_hist) > 1 else 0.0
+        
+        # Bollinger Bands(20,2)
+        bb_middle = c_s.rolling(min(len(c_s), 20)).mean()
+        bb_std = c_s.rolling(min(len(c_s), 20)).std()
+        bb_upper = float((bb_middle + 2 * bb_std).iloc[-1]) if len(bb_middle) > 0 else current_try * 1.05
+        bb_lower = float((bb_middle - 2 * bb_std).iloc[-1]) if len(bb_middle) > 0 else current_try * 0.95
+        
+        # EMA200
+        ema200 = float(c_s.ewm(span=200, adjust=False).mean().iloc[-1]) if len(c_s) > 0 else current_try
+        
+        # 1. Support score
+        score_sup = support_info["score"]
+        
+        # 2. RSI Score
+        score_rsi = 0.0
+        if rsi_val <= 30:
+            score_rsi = 100.0
+        elif rsi_val <= 45:
+            score_rsi = 100.0 - (rsi_val - 30) * 5.0
+        elif rsi_val <= 65:
+            score_rsi = 25.0
+            
+        # 3. MACD Score
+        score_macd = 0.0
+        if curr_macd_hist > 0:
+            score_macd = 100.0 if curr_macd_hist > prev_macd_hist else 70.0
+        else:
+            score_macd = 50.0 if curr_macd_hist > prev_macd_hist else 10.0
+            
+        # 4. Bollinger Score
+        score_bb = 0.0
+        if bb_upper > bb_lower:
+            pct_bb = (current_try - bb_lower) / (bb_upper - bb_lower)
+            if pct_bb <= 0.1:
+                score_bb = 100.0
+            elif pct_bb <= 0.5:
+                score_bb = 100.0 - (pct_bb - 0.1) * 200.0
+            else:
+                score_bb = 10.0
+                
+        # 5. EMA Score
+        score_ema = 100.0 if current_try > ema200 else 30.0
+        
+        # Composite Score
+        opt_w_sup = 0.60
+        opt_w_rsi = 0.15
+        opt_w_macd = 0.15
+        opt_w_bb = 0.05
+        opt_w_ema = 0.05
+        opt_buy_threshold = 60.0
+        opt_sl_atr = 2.0
+        opt_tp_atr = 3.0
+        
+        opt_composite_score = (
+            opt_w_sup * score_sup +
+            opt_w_rsi * score_rsi +
+            opt_w_macd * score_macd +
+            opt_w_bb * score_bb +
+            opt_w_ema * score_ema
+        ) / (opt_w_sup + opt_w_rsi + opt_w_macd + opt_w_bb + opt_w_ema)
+        
+        # Buy Zone (convert support from USD to TRY)
+        usd_rate = current_try / current_usd if current_usd > 0 else 38.0
+        nearest_sup_usd = support_info.get("nearest_support")
+        nearest_sup_try = nearest_sup_usd * usd_rate if nearest_sup_usd is not None else None
+        
+        if nearest_sup_try is not None:
+            buy_zone_low = nearest_sup_try
+            buy_zone_high = nearest_sup_try + 0.5 * atr_val
+        else:
+            buy_zone_low = current_try * 0.95
+            buy_zone_high = current_try * 0.97
+            
+        # Signal status
+        if opt_composite_score >= opt_buy_threshold:
+            opt_signal = "ALIM SİNYALİ"
+        elif current_try >= buy_zone_low and current_try <= buy_zone_high:
+            opt_signal = "ALIM BÖLGESİNDE (ONAY BEKLENİYOR)"
+        elif rsi_val < 33:
+            opt_signal = "AŞIRI SATIMDA (İZLEMEDE)"
+        else:
+            opt_signal = "BEKLE / NÖTR"
+            
+        # Entry ref for SL/TP
+        entry_ref = current_try if opt_composite_score >= opt_buy_threshold else buy_zone_high
+        opt_sl = entry_ref - opt_sl_atr * atr_val
+        opt_tp1 = entry_ref + opt_tp_atr * 0.5 * atr_val
+        opt_tp2 = entry_ref + opt_tp_atr * atr_val
+
         name = info.get("longName", ticker) or ticker
         sector = info.get("sector", "—") or "—"
 
@@ -545,6 +655,13 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime) -
             "adv50":               adv50,
             "adv3":                adv3,
             "sma20_try":           sma20_try,
+            "opt_score":           opt_composite_score,
+            "opt_signal":          opt_signal,
+            "opt_buy_zone_low":    buy_zone_low,
+            "opt_buy_zone_high":   buy_zone_high,
+            "opt_sl":              opt_sl,
+            "opt_tp1":             opt_tp1,
+            "opt_tp2":             opt_tp2,
         }
         res.update(bofa)
         return res
@@ -603,7 +720,7 @@ tab_scan, tab_calc, tab_single, tab_opt = st.tabs(["🔍 BIST Hisse Tarayıcı",
 with tab_scan:
     # Sidebar: Strategy & Filters
     st.sidebar.header("🎛️ Analiz Parametreleri")
-    strategy = st.sidebar.selectbox("Analiz Stratejisi", ["Destek + PD/DD", "BofA Kantitatif Faktör", "Hacim Kırılımı (Sıradışı Hacim)"], help="Hisseleri analiz ederken ve puanlarken kullanılacak temel mantık modelini seçin.")
+    strategy = st.sidebar.selectbox("Analiz Stratejisi", ["Destek + PD/DD", "BofA Kantitatif Faktör", "Hacim Kırılımı (Sıradışı Hacim)", "Optimum Alım Noktası (Backtest & Skor)"], help="Hisseleri analiz ederken ve puanlarken kullanılacak temel mantık modelini seçin.")
     
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Filtre Ayarları")
@@ -616,6 +733,9 @@ with tab_scan:
         min_surge_ratio = st.sidebar.slider("Min Hacim Artış Katsayısı (Kat)", 1.0, 10.0, 1.5, step=0.5, help="Son 3G Hacim / 50G Hacim oranı")
         max_normal_rank = st.sidebar.slider("Normal Hacim Limit Sırası (Normalde Dışında)", 10, 50, 20, help="Hissenin normalde bu sıralamanın dışında (daha az hacimli) olması gerekir")
         min_recent_rank = st.sidebar.slider("Son 3G Hacim Sıralama Limiti (Son 3G İçinde)", 10, 50, 20, help="Hissenin son 3 günde bu sıralamanın içinde (daha çok hacimli) olması gerekir")
+    elif strategy == "Optimum Alım Noktası (Backtest & Skor)":
+        min_opt_score = st.sidebar.slider("Min Birleşik Skor", 0, 100, 50, help="Optimum parametrelerle hesaplanan güncel teknik skor.")
+        filter_signal = st.sidebar.multiselect("Sinyal Durumu Filtresi", ["ALIM SİNYALİ", "ALIM BÖLGESİNDE (ONAY BEKLENİYOR)", "AŞIRI SATIMDA (İZLEMEDE)", "BEKLE / NÖTR"], default=["ALIM SİNYALİ", "ALIM BÖLGESİNDE (ONAY BEKLENİYOR)"])
     else:
         min_bofa = st.sidebar.slider("Min BofA Kompozit Skor", 0, 100, 50, help="4 faktörün (Değer, Büyüme, Kalite, Momentum) dengeli ortalama skoru.")
         min_value = st.sidebar.slider("Min Değer Skoru", 0, 100, 30, help="PEG Oranı, Serbest Nakit Verimi ve PD/DD sapma ortalaması.")
@@ -698,6 +818,13 @@ with tab_scan:
             ]
             # Sort by volume surge ratio descending
             filtered_df = filtered_df.sort_values(by="surge_ratio", ascending=False)
+        elif strategy == "Optimum Alım Noktası (Backtest & Skor)":
+            filtered_df = results_df[
+                (results_df["opt_score"] >= min_opt_score) &
+                (results_df["opt_signal"].isin(filter_signal))
+            ]
+            # Sort by composite score descending
+            filtered_df = filtered_df.sort_values(by="opt_score", ascending=False)
         else:
             filtered_df = results_df[
                 (results_df["bofa_composite"] >= min_bofa) &
@@ -729,6 +856,12 @@ with tab_scan:
                 display_df["adv50"] = display_df["adv50"].map(lambda x: f"₺{x:,.0f}" if pd.notnull(x) else "—")
                 display_df["adv3_rank"] = display_df["adv3_rank"].map(lambda x: f"{x:.0f}" if pd.notnull(x) else "—")
                 display_df["adv50_rank"] = display_df["adv50_rank"].map(lambda x: f"{x:.0f}" if pd.notnull(x) else "—")
+            elif strategy == "Optimum Alım Noktası (Backtest & Skor)":
+                display_df["opt_score"] = display_df["opt_score"].map("{:.1f}".format)
+                display_df["opt_buy_zone"] = display_df.apply(lambda r: f"₺{r['opt_buy_zone_low']:.2f} - ₺{r['opt_buy_zone_high']:.2f}", axis=1)
+                display_df["opt_sl"] = display_df["opt_sl"].map("₺{:,.2f}".format)
+                display_df["opt_tp1"] = display_df["opt_tp1"].map("₺{:,.2f}".format)
+                display_df["opt_tp2"] = display_df["opt_tp2"].map("₺{:,.2f}".format)
             else:
                 display_df["bofa_composite"] = display_df["bofa_composite"].map("{:.1f}".format)
                 display_df["bofa_score_value"] = display_df["bofa_score_value"].map("{:.1f}".format)
@@ -776,6 +909,22 @@ with tab_scan:
                         use_container_width=True,
                         hide_index=True
                     )
+                elif strategy == "Optimum Alım Noktası (Backtest & Skor)":
+                    st.dataframe(
+                        display_df[[
+                            "ticker", "name", "sector", "current_try", 
+                            "opt_score", "opt_signal", "opt_buy_zone", 
+                            "opt_sl", "opt_tp1", "opt_tp2"
+                        ]].rename(columns={
+                            "ticker": "Hisse", "name": "Adı", "sector": "Sektör",
+                            "current_try": "Fiyat ₺", "opt_score": "Birleşik Skor",
+                            "opt_signal": "Sinyal Durumu", "opt_buy_zone": "Optimum Alım Bölgesi",
+                            "opt_sl": "Zarar Kes (SL)", "opt_tp1": "Kar Al 1 (T1)",
+                            "opt_tp2": "Kar Al 2 (T2)"
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
                 else:
                     st.dataframe(
                         display_df[[
@@ -818,6 +967,9 @@ with tab_scan:
                     elif strategy == "Hacim Kırılımı (Sıradışı Hacim)":
                         score_to_draw = min(100.0, r.get("surge_ratio", 1.0) * 20.0)
                         title_to_draw = "HACİM SKORU"
+                    elif strategy == "Optimum Alım Noktası (Backtest & Skor)":
+                        score_to_draw = r["opt_score"]
+                        title_to_draw = "BİRLEŞİK SKOR"
                     else:
                         score_to_draw = r["bofa_composite"]
                         title_to_draw = "BOFA KOMPOZİT"
@@ -860,6 +1012,13 @@ with tab_scan:
                         st.markdown(render_row("50 Günlük Ortalama Hacim", f"₺{r.get('adv50', 0.0):,.0f}", ""), unsafe_allow_html=True)
                         st.markdown(render_row("Son 3G Hacim Sıralaması", f"{r.get('adv3_rank', 99):.0f} . sırada", "", "accent"), unsafe_allow_html=True)
                         st.markdown(render_row("Normal Hacim Sıralaması", f"{r.get('adv50_rank', 99):.0f} . sırada", ""), unsafe_allow_html=True)
+                    elif strategy == "Optimum Alım Noktası (Backtest & Skor)":
+                        st.markdown(render_row("Sinyal Durumu", f"{r['opt_signal']}", "", "green" if "ALIM SİNYALİ" in r['opt_signal'] else "yellow" if "BÖLGESİNDE" in r['opt_signal'] else "accent"), unsafe_allow_html=True)
+                        st.markdown(render_row("Birleşik Teknik Skor", f"{r['opt_score']:.1f}", "/ 100", "accent"), unsafe_allow_html=True)
+                        st.markdown(render_row("Optimum Alım Bölgesi", f"₺{r['opt_buy_zone_low']:.2f} - ₺{r['opt_buy_zone_high']:.2f}", ""), unsafe_allow_html=True)
+                        st.markdown(render_row("Zarar Kes (Stop-Loss)", f"₺{r['opt_sl']:.2f}", "", "red"), unsafe_allow_html=True)
+                        st.markdown(render_row("Kâr Al 1 (T1 Hedefi)", f"₺{r['opt_tp1']:.2f}", "", "green"), unsafe_allow_html=True)
+                        st.markdown(render_row("Kâr Al 2 (T2 Hedefi)", f"₺{r['opt_tp2']:.2f}", "", "green"), unsafe_allow_html=True)
                     else:
                         # BofA Factor Details Panel
                         st.markdown(f"""
@@ -906,7 +1065,10 @@ with tab_scan:
                     
                     # Send to Calculator Button
                     if st.button("📊 Seçili Hisseyi Hesaplayıcıya Gönder", use_container_width=True, type="primary"):
-                        st.session_state.calc_entry_price = r["current_try"]
+                        if strategy == "Optimum Alım Noktası (Backtest & Skor)":
+                            st.session_state.calc_entry_price = float(r["opt_buy_zone_high"])
+                        else:
+                            st.session_state.calc_entry_price = float(r["current_try"])
                         st.session_state.calc_usd_rate = r["current_try"] / r["current_usd"] if r["current_usd"] > 0 else 38.0
                         st.success(f"✅ {selected_ticker} bilgileri Pozisyon Hesaplayıcı sekmesine aktarıldı!")
                         
