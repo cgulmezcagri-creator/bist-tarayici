@@ -1358,6 +1358,11 @@ with tab_opt:
         with st.spinner(f"⏳ {opt_ticker} için veriler indiriliyor ve en iyi parametreler hesaplanıyor (Grid Search)..."):
             try:
                 # Import the analysis engine
+                import sys
+                import os
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                if current_dir not in sys.path:
+                    sys.path.append(current_dir)
                 from optimum_buy_analyzer import run_analysis_for_ticker
                 
                 # Setup dates
