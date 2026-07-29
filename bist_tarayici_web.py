@@ -473,7 +473,7 @@ def fetch_single_ticker_raw(ticker, start_date, end_date):
         pass
     return hist, info, qbs
 
-def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime) -> dict:
+def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime, strategy: str = "") -> dict:
     try:
         hist, info, qbs = fetch_single_ticker_raw(ticker, start, end)
         if hist.empty or len(hist) < 60:
@@ -585,15 +585,60 @@ def fetch_one_stock(ticker: str, usdtry: pd.Series, start, end, now: datetime) -
         # 5. EMA Score
         score_ema = 100.0 if current_try > ema200 else 30.0
         
-        # Composite Score
-        opt_w_sup = 0.60
-        opt_w_rsi = 0.15
-        opt_w_macd = 0.15
-        opt_w_bb = 0.05
-        opt_w_ema = 0.05
-        opt_buy_threshold = 60.0
-        opt_sl_atr = 2.0
-        opt_tp_atr = 3.0
+        # Composite Score and Threshold parameters
+        if strategy == "Optimum Alım Noktası (Backtest & Skor)":
+            try:
+                # Import path solver and optimizer
+                import sys
+                import os
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                if current_dir not in sys.path:
+                    sys.path.append(current_dir)
+                from optimum_buy_analyzer import StrategyOptimizer
+                
+                # Setup indicators df for optimization
+                df_indicators = hist.copy()
+                df_indicators['ATR'] = tr.rolling(min(len(tr), 14)).mean()
+                df_indicators['RSI'] = 100 - (100 / (1 + gain / (loss + 1e-9)))
+                df_indicators['MACD_Hist'] = macd_hist
+                df_indicators['BB_Upper'] = bb_middle + 2 * bb_std
+                df_indicators['BB_Lower'] = bb_middle - 2 * bb_std
+                df_indicators['EMA200'] = c_s.ewm(span=200, adjust=False).mean()
+                df_indicators = df_indicators.dropna()
+                
+                # Son 500 günde (2 yılda) optimize et
+                df_opt = df_indicators.iloc[-500:] if len(df_indicators) >= 500 else df_indicators
+                
+                # Get best parameters (using window=20 for pivots)
+                pivots_20 = find_pivot_lows(price_usd, window=20)
+                best_params, opt_results = StrategyOptimizer.optimize(df_opt, pivots_20, show_progress=False)
+                
+                opt_w_sup = best_params["w_support"]
+                opt_w_rsi = best_params["w_rsi"]
+                opt_w_macd = best_params["w_macd"]
+                opt_w_bb = best_params["w_bb"]
+                opt_w_ema = best_params["w_ema"]
+                opt_buy_threshold = best_params["buy_threshold"]
+                opt_sl_atr = best_params["sl_atr"]
+                opt_tp_atr = best_params["tp_atr"]
+            except Exception:
+                opt_w_sup = 0.60
+                opt_w_rsi = 0.15
+                opt_w_macd = 0.15
+                opt_w_bb = 0.05
+                opt_w_ema = 0.05
+                opt_buy_threshold = 60.0
+                opt_sl_atr = 2.0
+                opt_tp_atr = 3.0
+        else:
+            opt_w_sup = 0.60
+            opt_w_rsi = 0.15
+            opt_w_macd = 0.15
+            opt_w_bb = 0.05
+            opt_w_ema = 0.05
+            opt_buy_threshold = 60.0
+            opt_sl_atr = 2.0
+            opt_tp_atr = 3.0
         
         opt_composite_score = (
             opt_w_sup * score_sup +
@@ -781,7 +826,7 @@ with tab_scan:
             status_text.text(f"⏳ Taranıyor: {ticker} ({i+1}/{total})")
             progress_bar.progress((i + 1) / total)
             
-            res = fetch_one_stock(ticker, usdtry, start, end, now)
+            res = fetch_one_stock(ticker, usdtry, start, end, now, strategy=strategy)
             if res:
                 st.session_state.results[ticker] = res
                 success_count += 1
